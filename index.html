@@ -73,10 +73,13 @@
   .seg button { flex: 1; border: 0; background: var(--panel2); color: var(--muted); font: inherit; font-size: 14px; padding: 10px 0; cursor: pointer; }
   .seg button.on { background: var(--text); color: var(--bg); font-weight: 700; }
   .teach { display: grid; gap: 8px; }
-  .trow { display: grid; grid-template-columns: 14px 1fr auto; gap: 10px; align-items: center; background: var(--panel2); border-radius: 12px; padding: 10px 12px; }
+  .trow { display: grid; grid-template-columns: 14px 1fr; gap: 8px 10px; align-items: center; background: var(--panel2); border-radius: 12px; padding: 10px 12px; }
   .dot { width: 12px; height: 12px; border-radius: 50%; }
   .trow .name { font-weight: 500; }
   .trow .count { font-family: var(--mono); font-size: 12px; color: var(--muted); }
+  .trow > .row { grid-column: 1 / -1; flex-wrap: nowrap; }
+  .trow > .row .b { flex: 1; justify-content: center; }
+  .trow > .row .b:first-child, .trow > .row .b:last-child { flex: 0 0 44px; }
   .note { font-size: 12.5px; color: var(--muted); line-height: 1.45; }
   .legend { display: flex; gap: 12px; font-size: 12px; color: var(--muted); margin-top: 8px; flex-wrap: wrap; }
   .legend i { display: inline-block; width: 9px; height: 9px; border-radius: 3px; margin-right: 5px; vertical-align: -1px; }
@@ -197,7 +200,7 @@
     <details>
       <summary>Teach my sounds <small id="teachSum">not taught</small></summary>
       <div class="pane">
-        <div class="note">Until you teach it, clicks are auto-sorted by tone: darkest is kick, brightest is hat. Teaching fixes that. Record 6 to 10 of each sound with space between hits. For bass, do a few separate notes. Your sounds are stored on this device only.</div>
+        <div class="note">Until you teach it, clicks are auto-sorted by tone: darkest is kick, brightest is hat. Teaching fixes that. Record 6 to 10 of each sound with space between hits. For bass, do a few separate notes. Recording a sound again replaces it. Tap ▶ to hear a clip; a soft tick marks each hit the app found. The score shows how many of your hits it can tell apart from your other sounds. Everything stays on this device.</div>
         <div class="teach" id="teach"></div>
         <label class="toggle"><input type="checkbox" id="learnFix" checked> Learn from my fixes on the piano roll</label>
         <div class="row"><button class="b sm" id="clearTeach">Clear all</button></div>
@@ -778,6 +781,22 @@
     return { bass: out, key };
   }
 
+  // ---------- how well do the taught sounds separate? (leave-one-out) ----------
+  function separation(calib) {
+    const out = {};
+    const cls = ['kick', 'snare', 'hat', 'bass'].filter(c => (calib[c] || []).length);
+    for (const c of cls) out[c] = { n: 0, ok: 0, as: {} };
+    for (const c of cls) {
+      calib[c].forEach((h, i) => {
+        const rest = {}; for (const d of cls) rest[d] = calib[d].filter((_, j) => !(d === c && j === i));
+        const m = trainModel(rest); if (!m) return;
+        const got = knn(m, { vec: h.vec });
+        out[c].n++; if (got === c) out[c].ok++; else out[c].as[got] = (out[c].as[got] || 0) + 1;
+      });
+    }
+    return out;
+  }
+
   // ---------- calibration: isolated hits of one class ----------
   function calibFromClip(samples, sr) {
     const A = analyze(samples, sr);
@@ -1012,7 +1031,8 @@
       const qt = tOf(map, s);
       return Object.assign({}, b, { u, qu: s, que: e, qt, qdur: Math.max(0.03, tOf(map, e) - qt) });
     });
-    bass.sort((a, b) => a.qu - b.qu);
+    bass.sort((a, b) => a.qu - b.qu || b.dur - a.dur);
+    for (let i = bass.length - 1; i > 0; i--) if (Math.abs(bass[i].qu - bass[i - 1].qu) < 1e-6) bass.splice(i, 1); // same start: keep the longer
     for (let i = 0; i + 1 < bass.length; i++) if (bass[i].que > bass[i + 1].qu) { bass[i].que = bass[i + 1].qu; bass[i].qdur = Math.max(0.03, tOf(map, bass[i].que) - bass[i].qt); }
     return { drums, bass };
   }
@@ -1091,7 +1111,7 @@
     return out;
   }
 
-  root.MG = { cleanBass, detectKey, fixedMap, trackGrid, shiftMap, uOf, tOf, biquadLP, calibFromClip, analyze, pickOnsets, features, classify, trainModel, buildGroove, estimateTempo, alignGrid, quantizeGroove, writeMidi, zip, DRUM_NOTES, CLASSES };
+  root.MG = { separation, cleanBass, detectKey, fixedMap, trackGrid, shiftMap, uOf, tOf, biquadLP, calibFromClip, analyze, pickOnsets, features, classify, trainModel, buildGroove, estimateTempo, alignGrid, quantizeGroove, writeMidi, zip, DRUM_NOTES, CLASSES };
 })(typeof window !== 'undefined' ? window : globalThis);
 
 </script>
@@ -1974,12 +1994,46 @@ GM_SOUNDS.drums[42]={
 
   // ---------- teach ----------
   const TEACH = [['kick', 'Kick'], ['snare', 'Snare'], ['hat', 'Hat'], ['bass', 'Bass notes']];
+  // teach clips are kept on this device (IndexedDB) so they can be played back
+  const clips = {};
+  const idb = (() => {
+    let dbp = null;
+    const open = () => dbp || (dbp = new Promise((res, rej) => { try { const r = indexedDB.open('mouth-groove', 1); r.onupgradeneeded = () => r.result.createObjectStore('clips'); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); } catch (e) { rej(e); } }));
+    const tx = async (mode, fn) => { const db = await open(); return new Promise((res, rej) => { const t = db.transaction('clips', mode); const st = t.objectStore('clips'); const q = fn(st); t.oncomplete = () => res(q && q.result); t.onerror = () => rej(t.error); }); };
+    return { put: (k, v) => tx('readwrite', st => st.put(v, k)).catch(() => {}), get: k => tx('readonly', st => st.get(k)).catch(() => null), del: k => tx('readwrite', st => st.delete(k)).catch(() => {}) };
+  })();
+  (async () => { for (const [c] of TEACH) { const v = await idb.get(c); if (v && v.samples) clips[c] = v; } renderTeach(); })();
+
+  let clipSrc = [];
+  function stopClip() { for (const n of clipSrc) { try { n.stop(); } catch (e) {} } clipSrc = []; }
+  async function playClip(c) {
+    const v = clips[c]; if (!v) return;
+    stop(); stopClip(); audio(); await ctx.resume();
+    const buf = ctx.createBuffer(1, v.samples.length, SR); buf.getChannelData(0).set(v.samples);
+    const src = ctx.createBufferSource(); src.buffer = buf; src.connect(master);
+    const t0 = ctx.currentTime + 0.05; src.start(t0); clipSrc.push(src);
+    // a soft tick on every hit the app found, so you can hear what it picked up
+    for (const t of v.hits || []) {
+      const o = ctx.createOscillator(), g = ctx.createGain(); o.frequency.value = 2600;
+      g.gain.setValueAtTime(0.0001, t0 + t); g.gain.exponentialRampToValueAtTime(0.12, t0 + t + 0.002); g.gain.exponentialRampToValueAtTime(0.0001, t0 + t + 0.03);
+      o.connect(g); g.connect(master); o.start(t0 + t); o.stop(t0 + t + 0.04); clipSrc.push(o);
+    }
+  }
+  function sepText(sep, c) {
+    const r = sep[c]; if (!r || !r.n) return '';
+    const miss = Object.entries(r.as).sort((a, b) => b[1] - a[1]).map(([k, n]) => `${n} heard as ${k}`).join(', ');
+    return ` · ${r.ok}/${r.n} clear${miss ? ' (' + miss + ')' : ''}`;
+  }
   function renderTeach() {
     const el = $('teach'); el.innerHTML = '';
+    const sep = MG.separation(calib);
     for (const [c, label] of TEACH) {
       const row = document.createElement('div'); row.className = 'trow';
-      row.innerHTML = `<span class="dot" style="background:${CL[c]}"></span><div><div class="name">${label}</div><div class="count">${(calib[c] || []).length} samples</div></div><div class="row"></div>`;
+      const n = (calib[c] || []).length;
+      row.innerHTML = `<span class="dot" style="background:${CL[c]}"></span><div><div class="name">${label}</div><div class="count">${n} hits${sepText(sep, c)}</div></div><div class="row"></div>`;
       const btns = row.lastChild;
+      const pl = document.createElement('button'); pl.className = 'b sm'; pl.textContent = '▶'; pl.setAttribute('aria-label', 'Play ' + label + ' clip');
+      pl.disabled = !clips[c]; pl.onclick = () => playClip(c);
       const r = document.createElement('button'); r.className = 'b sm'; r.textContent = 'Record';
       r.onclick = () => {
         if (S.micBlocked) { toast('Mic is blocked here. Use Import.'); return; }
@@ -1990,20 +2044,23 @@ GM_SOUNDS.drums[42]={
       inp.onchange = async e => { const f = e.target.files[0]; if (!f) return; try { const b = await decode(await f.arrayBuffer()); addCalib(c, toMono22k(b)); } catch (er) { toast('Could not read that file'); } };
       imp.appendChild(inp);
       const clr = document.createElement('button'); clr.className = 'b sm'; clr.textContent = '×'; clr.setAttribute('aria-label', 'Clear ' + label);
-      clr.onclick = () => { calib[c] = []; store.set('mg.calib.v1', calib); retrain(); if (S.A) regroove(true); };
+      clr.onclick = () => { calib[c] = []; delete clips[c]; idb.del(c); store.set('mg.calib.v1', calib); retrain(); if (S.A) regroove(true); };
       if (S.micBlocked) r.disabled = true;
-      btns.append(r, imp, clr); el.appendChild(row);
+      btns.append(pl, r, imp, clr); el.appendChild(row);
     }
   }
   function addCalib(c, samples) {
     const r = MG.calibFromClip(samples, SR);
     if (!r.hits.length) { toast('No hits found. Try a bit louder.'); return; }
-    calib[c] = (calib[c] || []).concat(r.hits.map(h => ({ vec: h.vec, upper: h.upper }))).slice(-40);
+    // a new recording replaces that sound's old samples, so you can redo one sound at a time
+    calib[c] = r.hits.map(h => ({ vec: h.vec, upper: h.upper })).slice(-40);
+    clips[c] = { samples, hits: r.hits.map(h => h.t) };
+    idb.put(c, clips[c]);
     store.set('mg.calib.v1', calib); retrain();
-    toast(`Learned ${r.hits.length} ${c} samples`);
+    toast(`Found ${r.hits.length} ${c} hits. Tap ▶ to hear them.`);
     if (S.A) regroove(true);
   }
-  $('clearTeach').onclick = () => { calib = { kick: [], snare: [], hat: [], bass: [] }; store.set('mg.calib.v1', calib); retrain(); if (S.A) regroove(true); };
+  $('clearTeach').onclick = () => { for (const [c] of TEACH) { delete clips[c]; idb.del(c); } calib = { kick: [], snare: [], hat: [], bass: [] }; store.set('mg.calib.v1', calib); retrain(); if (S.A) regroove(true); };
 
   // ---------- piano roll ----------
   const LBL = 46, WAVE = 34, DR = 26, BR = 13, PAD = 8;
@@ -2145,7 +2202,7 @@ GM_SOUNDS.drums[42]={
       }
     }
   });
-  function retrainLabelsOnly() { const n = ['kick', 'snare', 'hat', 'bass'].map(c => (calib[c] || []).length); $('teachSum').textContent = n.join(' / '); }
+  function retrainLabelsOnly() { const n = ['kick', 'snare', 'hat', 'bass'].map(c => (calib[c] || []).length); $('teachSum').textContent = n.join(' / '); clearTimeout(retrainLabelsOnly.t); retrainLabelsOnly.t = setTimeout(renderTeach, 300); }
 
   // ---------- transport ----------
   let pb = null;

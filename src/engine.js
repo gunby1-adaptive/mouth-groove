@@ -549,6 +549,22 @@
     return { bass: out, key };
   }
 
+  // ---------- how well do the taught sounds separate? (leave-one-out) ----------
+  function separation(calib) {
+    const out = {};
+    const cls = ['kick', 'snare', 'hat', 'bass'].filter(c => (calib[c] || []).length);
+    for (const c of cls) out[c] = { n: 0, ok: 0, as: {} };
+    for (const c of cls) {
+      calib[c].forEach((h, i) => {
+        const rest = {}; for (const d of cls) rest[d] = calib[d].filter((_, j) => !(d === c && j === i));
+        const m = trainModel(rest); if (!m) return;
+        const got = knn(m, { vec: h.vec });
+        out[c].n++; if (got === c) out[c].ok++; else out[c].as[got] = (out[c].as[got] || 0) + 1;
+      });
+    }
+    return out;
+  }
+
   // ---------- calibration: isolated hits of one class ----------
   function calibFromClip(samples, sr) {
     const A = analyze(samples, sr);
@@ -783,7 +799,8 @@
       const qt = tOf(map, s);
       return Object.assign({}, b, { u, qu: s, que: e, qt, qdur: Math.max(0.03, tOf(map, e) - qt) });
     });
-    bass.sort((a, b) => a.qu - b.qu);
+    bass.sort((a, b) => a.qu - b.qu || b.dur - a.dur);
+    for (let i = bass.length - 1; i > 0; i--) if (Math.abs(bass[i].qu - bass[i - 1].qu) < 1e-6) bass.splice(i, 1); // same start: keep the longer
     for (let i = 0; i + 1 < bass.length; i++) if (bass[i].que > bass[i + 1].qu) { bass[i].que = bass[i + 1].qu; bass[i].qdur = Math.max(0.03, tOf(map, bass[i].que) - bass[i].qt); }
     return { drums, bass };
   }
@@ -862,5 +879,5 @@
     return out;
   }
 
-  root.MG = { cleanBass, detectKey, fixedMap, trackGrid, shiftMap, uOf, tOf, biquadLP, calibFromClip, analyze, pickOnsets, features, classify, trainModel, buildGroove, estimateTempo, alignGrid, quantizeGroove, writeMidi, zip, DRUM_NOTES, CLASSES };
+  root.MG = { separation, cleanBass, detectKey, fixedMap, trackGrid, shiftMap, uOf, tOf, biquadLP, calibFromClip, analyze, pickOnsets, features, classify, trainModel, buildGroove, estimateTempo, alignGrid, quantizeGroove, writeMidi, zip, DRUM_NOTES, CLASSES };
 })(typeof window !== 'undefined' ? window : globalThis);
