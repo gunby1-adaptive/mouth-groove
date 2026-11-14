@@ -2,8 +2,8 @@
 (function (root) {
   'use strict';
 
-  const CLASSES = ['kick', 'snare', 'hat', 'bass'];
-  const DRUM_NOTES = { kick: 36, snare: 38, hat: 42 };
+  const CLASSES = ['kick', 'snare', 'hat', 'ohat', 'bass'];
+  const DRUM_NOTES = { kick: 36, snare: 38, hat: 42, ohat: 46 };
 
   // ---------- FFT (radix-2, in place) ----------
   function makeFFT(n) {
@@ -286,9 +286,13 @@
     if (model && model.up) {
       const z = [Math.log2(u.cen), Math.log2(u.decay + 0.02)];
       const d = c => { const m = model.up[c]; return ((z[0] - m[0]) / 0.5) ** 2 + ((z[1] - m[1]) / 1.5) ** 2; };
-      return d('hat') <= d('snare') ? 'hat' : 'snare';
+      let best = null, bd = 1e9;
+      for (const c of Object.keys(model.up)) { const v = d(c); if (v < bd) { bd = v; best = c; } }
+      return best;
     }
-    return (u.cen > 5500 && u.decay < 0.25) || u.cen > 7500 ? 'hat' : 'snare';
+    const bright = (u.cen > 4800 && u.decay < 0.3) || u.cen > 7500;
+    if (bright) return u.decay > 0.45 ? 'ohat' : 'hat';
+    return 'snare';
   }
   function kickOrBass(ft) {
     return ft.ap < 0.3 && ft.lowDecay > 0.7 && (ft.relLow ?? 0) < 0.6 ? 'bass' : 'kick';
@@ -325,7 +329,7 @@
     const cb = [0, 1, 2].map(k => { const v = hits.map((o, i) => lab[i] === k ? bright[i] : null).filter(v => v != null); return v.length ? median(v) : 0; });
     const rank = [0, 1, 2].sort((a, b) => cb[a] - cb[b]);
     const name = {}; name[rank[0]] = 'kick'; name[rank[1]] = 'snare'; name[rank[2]] = 'hat';
-    hits.forEach((o, i) => { o.cls = name[lab[i]]; o.auto = true; });
+    hits.forEach((o, i) => { o.cls = name[lab[i]]; o.auto = true; if (o.cls === 'hat' && o.ft.upper.decay > 0.45) o.cls = 'ohat'; });
   }
 
   function trainModel(calib) {
@@ -341,11 +345,12 @@
     for (let i = 0; i < dim; i++) sd[i] = Math.sqrt(sd[i]) + 1e-3;
     const pts = all.map(s => ({ c: s.c, z: s.v.map((v, i) => (v - mean[i]) / sd[i]) }));
     let up = null;
-    const hs = all.filter(s => s.c === 'hat' && s.u), ss = all.filter(s => s.c === 'snare' && s.u);
-    if (hs.length >= 2 && ss.length >= 2) {
-      const m = arr => [median(arr.map(s => Math.log2(s.u.cen))), median(arr.map(s => Math.log2(s.u.decay + 0.02)))];
-      up = { hat: m(hs), snare: m(ss) };
+    const m = arr => [median(arr.map(s => Math.log2(s.u.cen))), median(arr.map(s => Math.log2(s.u.decay + 0.02)))];
+    for (const c of ['hat', 'ohat', 'snare']) {
+      const a = all.filter(s => s.c === c && s.u);
+      if (a.length >= 2) (up = up || {})[c] = m(a);
     }
+    if (up && Object.keys(up).length < 2) up = null;
     return { mean, sd, pts, classes: classesWithData, up };
   }
 
@@ -460,12 +465,14 @@
     if (!model && opts.autoSort !== false) autoSort(raw);
     // overlapping hits: a bass or kick onset can also carry a hat or snare on top
     const ref = c => median(raw.filter(o => o.cls === c).map(o => o.ft.upper.level));
-    const hsRef = Math.min(ref('hat') || Infinity, ref('snare') || Infinity);
+    const hsRef = Math.min(ref('hat') || Infinity, ref('ohat') || Infinity, ref('snare') || Infinity);
     const kickRef = ref('kick');
     const thr = Math.max(0.6 * (hsRef || 0), 3 * (kickRef || 0)) * (1.3 - 0.6 * (opts.drumSensitivity ?? 0.5));
     const extra = [];
-    if (opts.stack !== false && hsRef > 0 && hsRef < Infinity) for (const o of raw) {
-      if ((o.cls === 'bass' || o.cls === 'kick') && o.ft.upper.level > thr) {
+    // a hat or snare riding on a bass note is always kept (it's the only drum there);
+    // a hat or snare on top of a kick is a stacked hit, kept only when stacking is on
+    if (hsRef > 0 && hsRef < Infinity) for (const o of raw) {
+      if ((o.cls === 'bass' || (o.cls === 'kick' && opts.stack !== false)) && o.ft.upper.level > thr) {
         extra.push({ t: o.t, sample: o.sample, strength: o.strength, ft: o.ft, cls: upperClass(o.ft.upper, model), layered: true });
       }
     }
@@ -487,7 +494,7 @@
     }
     const lv = {};
     const lev = d => d.layered || d.cls !== 'kick' ? d.ft.upper.level : d.ft.level;
-    for (const c of ['kick', 'snare', 'hat']) lv[c] = percentile(drums.filter(d => d.cls === c).map(lev), 0.9) || 1;
+    for (const c of ['kick', 'snare', 'hat', 'ohat']) lv[c] = percentile(drums.filter(d => d.cls === c).map(lev), 0.9) || 1;
     for (const d of drums) d.vel = Math.max(35, Math.min(127, Math.round(105 + 45 * Math.log10(lev(d) / lv[d.cls]))));
     return { drums: drums.map(d => ({ t: d.t, cls: d.cls, vel: d.vel, ft: d.ft, layered: !!d.layered })), bass, onsets: raw };
   }
@@ -552,7 +559,7 @@
   // ---------- how well do the taught sounds separate? (leave-one-out) ----------
   function separation(calib) {
     const out = {};
-    const cls = ['kick', 'snare', 'hat', 'bass'].filter(c => (calib[c] || []).length);
+    const cls = ['kick', 'snare', 'hat', 'ohat', 'bass'].filter(c => (calib[c] || []).length);
     for (const c of cls) out[c] = { n: 0, ok: 0, as: {} };
     for (const c of cls) {
       calib[c].forEach((h, i) => {
@@ -613,7 +620,7 @@
   function alignGrid(groove, bpm, hint) {
     const P = 60 / bpm;
     const ev = [];
-    for (const d of groove.drums) ev.push({ t: d.t, w: d.cls === 'hat' ? 0.5 : 1, bw: d.cls === 'hat' ? 0.3 : 1, kick: d.cls === 'kick', snare: d.cls === 'snare' });
+    for (const d of groove.drums) ev.push({ t: d.t, w: d.cls === 'hat' || d.cls === 'ohat' ? 0.5 : 1, bw: d.cls === 'hat' || d.cls === 'ohat' ? 0.3 : 1, kick: d.cls === 'kick', snare: d.cls === 'snare' });
     for (const b of groove.bass) ev.push({ t: b.t, w: 0.6, bw: 0.3 });
     if (!ev.length) return 0;
     let best = 0, bs = -1e9;
@@ -691,7 +698,7 @@
   // Follow a drifting human tempo: phase-locked 16th grid, then smoothed into a tempo map
   function trackGrid(groove, bpm, duration) {
     let ev = [];
-    for (const d of groove.drums) ev.push({ t: d.t, w: d.cls === 'hat' ? 0.6 : 1, cls: d.cls });
+    for (const d of groove.drums) ev.push({ t: d.t, w: d.cls === 'hat' || d.cls === 'ohat' ? 0.6 : 1, cls: d.cls });
     for (const b of groove.bass) ev.push({ t: b.t, w: 0.5, cls: 'bass' });
     ev.sort((a, b) => a.t - b.t);
     const m = [];

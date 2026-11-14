@@ -13,7 +13,7 @@
 <style>
   :root {
     --bg: #0f0e0d; --panel: #191715; --panel2: #221f1c; --line: #2e2a26; --text: #efe9df; --muted: #8f877b;
-    --accent: #8ef0c4; --kick: #ff6a4d; --snare: #f4d35e; --hat: #6cd4c8; --bass: #ffb347; --rec: #ff4d4d;
+    --accent: #8ef0c4; --kick: #ff6a4d; --snare: #f4d35e; --hat: #6cd4c8; --ohat: #b79cff; --bass: #ffb347; --rec: #ff4d4d;
     --mono: 'JetBrains Mono', ui-monospace, Menlo, monospace;
   }
   * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
@@ -123,7 +123,7 @@
       <canvas class="labels" id="labelCanvas"></canvas>
       <div class="empty" id="empty">Record or import a groove. Bass and drums show up here as MIDI.</div>
     </div>
-    <div class="legend"><span><i style="background:var(--kick)"></i>Kick</span><span><i style="background:var(--snare)"></i>Snare</span><span><i style="background:var(--hat)"></i>Hat</span><span><i style="background:var(--bass)"></i>Bass</span><span style="margin-left:auto">Tap a hit to change it</span></div>
+    <div class="legend"><span><i style="background:var(--kick)"></i>Kick</span><span><i style="background:var(--snare)"></i>Snare</span><span><i style="background:var(--hat)"></i>Hat</span><span><i style="background:var(--ohat)"></i>Open hat</span><span><i style="background:var(--bass)"></i>Bass</span><span style="margin-left:auto">Tap a hit to change it</span></div>
     <div class="transport">
       <button class="play" id="playBtn" aria-label="Play" disabled><svg viewBox="0 0 24 24" fill="currentColor" id="playIcon"><path d="M7 4.5v15l13-7.5z"/></svg></button>
       <button class="b sm on" id="loopBtn">Loop</button>
@@ -183,7 +183,7 @@
           <select id="keySel"></select>
         </div>
         <label class="toggle"><input type="checkbox" id="mergeSlides" checked> Merge slides into one note</label>
-        <div class="note">Drums play on the General MIDI kit: kick 36, snare 38, closed hat 42, channel 10.</div>
+        <div class="note">Drums play on the General MIDI kit: kick 36, snare 38, closed hat 42, open hat 46, channel 10. A closed hat cuts off a ringing open hat, like a real kit.</div>
       </div>
     </details>
     <details>
@@ -240,7 +240,7 @@
   'use strict';
   const $ = id => document.getElementById(id);
   const SR = 22050;
-  const CL = { kick: '#ff6a4d', snare: '#f4d35e', hat: '#6cd4c8', bass: '#ffb347' };
+  const CL = { kick: '#ff6a4d', snare: '#f4d35e', hat: '#6cd4c8', ohat: '#b79cff', bass: '#ffb347' };
   const PATCH = { 33: 'Finger bass', 34: 'Pick bass', 32: 'Acoustic bass', 38: 'Synth bass 1', 39: 'Synth bass 2' };
   const S = {
     take: null, A: null, groove: null, q: null, model: null,
@@ -255,7 +255,7 @@
     get(k, d) { try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : d; } catch (e) { return d; } },
     set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} },
   };
-  let calib = store.get('mg.calib.v1', { kick: [], snare: [], hat: [], bass: [] });
+  let calib = Object.assign({ kick: [], snare: [], hat: [], ohat: [], bass: [] }, store.get('mg.calib.v1', {}));
 
   // ---------- audio ----------
   let ctx = null, master = null, voiceGain = null, midiGain = null;
@@ -303,7 +303,7 @@
   }
   async function loadSounds() {
     await Promise.all([loadPreset('b' + S.program, GM_SOUNDS.bass[S.program]),
-      ...[36, 38, 42].map(n => loadPreset('d' + n, GM_SOUNDS.drums[n]))]);
+      ...[36, 38, 42, 46].map(n => loadPreset('d' + n, GM_SOUNDS.drums[n]))]);
   }
   const live = new Set();
   function track(src) { live.add(src); src.onended = () => live.delete(src); return src; }
@@ -321,9 +321,10 @@
     const amp = Math.pow(vel / 127, 1.6) * (isBass ? 0.9 : 0.8);
     g.gain.setValueAtTime(0, when); g.gain.linearRampToValueAtTime(amp, when + 0.004);
     if (isBass) { g.gain.setValueAtTime(amp, when + dur); g.gain.linearRampToValueAtTime(0, when + dur + 0.07); }
+    else if (dur > 0) { g.gain.setValueAtTime(amp, when + dur); g.gain.linearRampToValueAtTime(0, when + dur + 0.03); }
     src.connect(g); g.connect(midiGain);
     src.start(when, delay);
-    src.stop(when + (isBass ? dur + 0.09 : Math.min(2, z.buffer.duration)));
+    src.stop(when + (isBass ? dur + 0.09 : dur > 0 ? Math.min(dur + 0.04, z.buffer.duration) : Math.min(2, z.buffer.duration)));
     track(src);
   }
   function clickAt(when, accent) {
@@ -336,7 +337,7 @@
   // ---------- pipeline ----------
   function retrain() {
     S.model = MG.trainModel(calib);
-    const n = ['kick', 'snare', 'hat', 'bass'].map(c => (calib[c] || []).length);
+    const n = ['kick', 'snare', 'hat', 'ohat', 'bass'].map(c => (calib[c] || []).length);
     $('teachSum').textContent = n.some(Boolean) ? n.join(' / ') : 'auto-sorting';
     renderTeach();
   }
@@ -480,7 +481,7 @@
   };
 
   // ---------- teach ----------
-  const TEACH = [['kick', 'Kick'], ['snare', 'Snare'], ['hat', 'Hat'], ['bass', 'Bass notes']];
+  const TEACH = [['kick', 'Kick'], ['snare', 'Snare'], ['hat', 'Closed hat'], ['ohat', 'Open hat'], ['bass', 'Bass notes']];
   // teach clips are kept on this device (IndexedDB) so they can be played back
   const clips = {};
   const idb = (() => {
@@ -547,7 +548,7 @@
     toast(`Found ${r.hits.length} ${c} hits. Tap ▶ to hear them.`);
     if (S.A) regroove(true);
   }
-  $('clearTeach').onclick = () => { for (const [c] of TEACH) { delete clips[c]; idb.del(c); } calib = { kick: [], snare: [], hat: [], bass: [] }; store.set('mg.calib.v1', calib); retrain(); if (S.A) regroove(true); };
+  $('clearTeach').onclick = () => { for (const [c] of TEACH) { delete clips[c]; idb.del(c); } calib = { kick: [], snare: [], hat: [], ohat: [], bass: [] }; store.set('mg.calib.v1', calib); retrain(); if (S.A) regroove(true); };
 
   // ---------- piano roll ----------
   const LBL = 46, WAVE = 34, DR = 26, BR = 13, PAD = 8;
@@ -562,12 +563,12 @@
     const notes = S.q.bass.map(b => b.note);
     let lo = notes.length ? Math.min(...notes) - 2 : 36, hi = notes.length ? Math.max(...notes) + 2 : 48;
     if (hi - lo < 12) { const m = (hi + lo) >> 1; lo = m - 6; hi = m + 6; }
-    const W = Math.ceil(LBL + (t1 - t0) * pps + 20), H = PAD + WAVE + 6 + 3 * DR + 8 + (hi - lo + 1) * BR + PAD;
+    const W = Math.ceil(LBL + (t1 - t0) * pps + 20), H = PAD + WAVE + 6 + 4 * DR + 8 + (hi - lo + 1) * BR + PAD;
     const dpr = Math.min(3, window.devicePixelRatio || 1);
     cv.width = W * dpr; cv.height = H * dpr; cv.style.width = W + 'px'; cv.style.height = H + 'px';
     const g = cv.getContext('2d'); g.setTransform(dpr, 0, 0, dpr, 0, 0);
     const X = t => LBL + (t - t0) * pps;
-    const yW = PAD, yD = PAD + WAVE + 6, yB = yD + 3 * DR + 8;
+    const yW = PAD, yD = PAD + WAVE + 6, yB = yD + 4 * DR + 8;
     layout = { X, t0, pps, yD, yB, lo, hi, W, H };
     g.fillStyle = '#121110'; g.fillRect(0, 0, W, H);
     // bass lane shading
@@ -575,7 +576,7 @@
       const y = yB + (hi - n) * BR, black = [1, 3, 6, 8, 10].includes(((n % 12) + 12) % 12);
       g.fillStyle = black ? '#151412' : '#191715'; g.fillRect(LBL, y, W - LBL, BR);
     }
-    for (let r = 0; r < 3; r++) { g.fillStyle = r % 2 ? '#171513' : '#1a1816'; g.fillRect(LBL, yD + r * DR, W - LBL, DR); }
+    for (let r = 0; r < 4; r++) { g.fillStyle = r % 2 ? '#171513' : '#1a1816'; g.fillRect(LBL, yD + r * DR, W - LBL, DR); }
     // grid
     const stepU = 16 / S.grid, step = P * 4 / S.grid;
     const uFirst = Math.floor(MG.uOf(S.map, t0) / stepU) * stepU;
@@ -599,7 +600,7 @@
       g.fillRect(x, yW + WAVE / 2 - h, 1, h * 2 || 1);
     }
     // drums
-    const rowOf = { hat: 0, snare: 1, kick: 2 };
+    const rowOf = { ohat: 0, hat: 1, snare: 2, kick: 3 };
     for (const d of S.q.drums) {
       const x = X(d.qt);
       if (d.cls === 'off') {
@@ -631,7 +632,7 @@
     const g = lc.getContext('2d'); g.setTransform(dpr, 0, 0, dpr, 0, 0);
     g.fillStyle = 'rgba(18,17,16,.96)'; g.fillRect(0, 0, LBL, H);
     g.font = '600 10px JetBrains Mono, monospace'; g.textBaseline = 'middle';
-    [['HAT', 'hat'], ['SNR', 'snare'], ['KCK', 'kick']].forEach(([t, c], r) => { g.fillStyle = CL[c]; g.fillText(t, 8, layout.yD + r * DR + DR / 2); });
+    [['OH', 'ohat'], ['HAT', 'hat'], ['SNR', 'snare'], ['KCK', 'kick']].forEach(([t, c], r) => { g.fillStyle = CL[c]; g.fillText(t, 8, layout.yD + r * DR + DR / 2); });
     for (let n = layout.lo; n <= layout.hi; n++) {
       const pc = ((n % 12) + 12) % 12;
       if (pc === 0 || pc === 4 || pc === 7 || n === layout.lo) { g.fillStyle = pc === 0 ? '#efe9df' : '#8f877b'; g.fillText(NN[pc] + (Math.floor(n / 12) - 1), 8, layout.yB + (layout.hi - n) * BR + BR / 2); }
@@ -659,11 +660,11 @@
     down = null;
     const r = e.currentTarget.getBoundingClientRect(), x = e.clientX - r.left, y = e.clientY - r.top;
     const step = (60 / S.bpm) * 4 / S.grid;
-    if (y >= layout.yD && y < layout.yD + 3 * DR) {
+    if (y >= layout.yD && y < layout.yD + 4 * DR) {
       let best = null, bd = 14;
       for (const d of S.q.drums) { const dx = Math.abs(layout.X(d.qt) + 5 - x); if (dx < bd) { bd = dx; best = d; } }
       if (best) {
-        const order = ['kick', 'snare', 'hat', 'off'];
+        const order = ['kick', 'snare', 'hat', 'ohat', 'off'];
         const nx = order[(order.indexOf(best.cls) + 1) % order.length];
         S.edits[best.i] = nx;
         if (nx !== 'off' && $('learnFix').checked && !best.layered && best.ft) {
@@ -674,7 +675,7 @@
         return;
       }
       // empty spot in a lane: add a hit
-      const row = Math.floor((y - layout.yD) / DR), cls = ['hat', 'snare', 'kick'][row];
+      const row = Math.floor((y - layout.yD) / DR), cls = ['ohat', 'hat', 'snare', 'kick'][row];
       const t = layout.t0 + (x - LBL) / layout.pps;
       S.groove.drums.push({ t, cls, vel: 100, ft: null, added: true });
       S.edits = Object.assign({}, S.edits); requant(); toast(`Added ${cls}`, 1200);
@@ -689,7 +690,7 @@
       }
     }
   });
-  function retrainLabelsOnly() { const n = ['kick', 'snare', 'hat', 'bass'].map(c => (calib[c] || []).length); $('teachSum').textContent = n.join(' / '); clearTimeout(retrainLabelsOnly.t); retrainLabelsOnly.t = setTimeout(renderTeach, 300); }
+  function retrainLabelsOnly() { const n = ['kick', 'snare', 'hat', 'ohat', 'bass'].map(c => (calib[c] || []).length); $('teachSum').textContent = n.join(' / '); clearTimeout(retrainLabelsOnly.t); retrainLabelsOnly.t = setTimeout(renderTeach, 300); }
 
   // ---------- transport ----------
   let pb = null;
@@ -710,7 +711,9 @@
     const P = 60 / S.bpm;
     for (const d of S.q.drums) {
       if (d.cls === 'off' || d.qt < from - 0.02 || d.qt >= to - 0.001) continue;
-      playZone(GM_SOUNDS.drums[MG.DRUM_NOTES[d.cls]], MG.DRUM_NOTES[d.cls], when + Math.max(0, d.qt - from), 0, d.vel, false);
+      let choke = 0;
+      if (d.cls === 'ohat') { const nx = S.q.drums.find(e => (e.cls === 'hat' || e.cls === 'ohat') && e.qt > d.qt + 0.01); if (nx && nx.qt < to) choke = nx.qt - d.qt; }
+      playZone(GM_SOUNDS.drums[MG.DRUM_NOTES[d.cls]], MG.DRUM_NOTES[d.cls], when + Math.max(0, d.qt - from), choke, d.vel, false);
     }
     for (const b of S.q.bass) {
       if (b.off || b.qt < from - 0.02 || b.qt >= to) continue;
