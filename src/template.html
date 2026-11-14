@@ -176,6 +176,10 @@
         <div class="field"><span>Bass octave <b id="octVal">0</b></span>
           <div class="row"><button class="b sm" id="octDown">Octave down</button><button class="b sm" id="octUp">Octave up</button></div>
         </div>
+        <div class="field"><span>Snap bass to key <b id="keyVal">auto</b></span>
+          <select id="keySel"></select>
+        </div>
+        <label class="toggle"><input type="checkbox" id="mergeSlides" checked> Merge slides into one note</label>
         <div class="note">Drums play on the General MIDI kit: kick 36, snare 38, closed hat 42, channel 10.</div>
       </div>
     </details>
@@ -184,6 +188,8 @@
       <div class="pane">
         <div class="field"><span>Drum sensitivity <b id="dsVal">50</b></span><input type="range" id="drumSens" min="0" max="1" step="0.05" value="0.5"></div>
         <div class="field"><span>Bass sensitivity <b id="bsVal">50</b></span><input type="range" id="bassSens" min="0" max="1" step="0.05" value="0.5"></div>
+        <label class="toggle"><input type="checkbox" id="onePerStep" checked> One drum per grid step (keeps the loudest)</label>
+        <label class="toggle"><input type="checkbox" id="stack"> Allow stacked hits (bass note plus hat or snare at once)</label>
         <div class="field"><span>Merge double clicks within <b id="mgVal">65 ms</b></span><input type="range" id="merge" min="0" max="120" step="5" value="65"></div>
         <div class="note">More drum sensitivity catches ghost notes but can add false hits. More bass sensitivity catches quieter notes.</div>
       </div>
@@ -204,6 +210,7 @@
         <div class="row">
           <button class="b primary" id="exportBtn" disabled>Export MIDI</button>
           <button class="b" id="shareBtn" disabled style="display:none">Share…</button>
+          <button class="b" id="wavBtn" disabled style="display:none">Save recording (.wav)</button>
         </div>
       </div>
     </details>
@@ -236,6 +243,7 @@
     take: null, A: null, groove: null, q: null, model: null,
     bpm: 100, offset: 0, grid: 16, strength: 1, swing: 0, octave: 0, program: 33,
     drumSens: 0.5, bassSens: 0.5, offsetHint: null, follow: true, mergeMs: 65, map: null,
+    key: 'auto', mergeSlides: true, stack: false, onePerStep: true, keyFound: null,
     edits: {}, bassOff: {}, zoom: 1, playing: false, loop: true, click: false,
   };
 
@@ -331,7 +339,9 @@
   }
   function regroove(keepTempo) {
     if (!S.A) return;
-    S.groove = MG.buildGroove(S.A, S.model, { drumSensitivity: S.drumSens, bassSensitivity: S.bassSens, bassOctave: 0, mergeMs: S.mergeMs });
+    S.groove = MG.buildGroove(S.A, S.model, { drumSensitivity: S.drumSens, bassSensitivity: S.bassSens, bassOctave: 0, mergeMs: S.mergeMs, stack: S.stack });
+    const cb = MG.cleanBass(S.groove.bass, { merge: S.mergeSlides, key: S.key });
+    S.groove.bass = cb.bass; S.keyFound = cb.key;
     S.edits = {}; S.bassOff = {};
     if (!keepTempo) {
       if (!S.bpmFixed) S.bpm = Math.round(MG.estimateTempo(S.A, S.groove) * 2) / 2;
@@ -352,14 +362,14 @@
   function currentGroove() {
     const g = S.groove;
     const drums = [];
-    g.drums.forEach((d, i) => { const c = S.edits[i] || d.cls; drums.push(Object.assign({}, d, { cls: c, i })); });
+    g.drums.forEach((d, i) => { const c = S.edits[i] || d.cls; drums.push(Object.assign({}, d, { cls: c, i, edited: !!S.edits[i] || !!d.added })); });
     const bass = g.bass.map((b, i) => Object.assign({}, b, { note: b.note + 12 * S.octave, i, off: !!S.bassOff[i] }));
     return { drums, bass };
   }
   function requant() {
     if (!S.groove) return;
     const g = currentGroove();
-    S.q = MG.quantizeGroove(g, S.map, S.grid, S.strength, S.swing);
+    S.q = MG.quantizeGroove(g, S.map, S.grid, S.strength, S.swing, { onePerStep: S.onePerStep });
     syncUI(); draw();
   }
 
@@ -376,7 +386,7 @@
       regroove(false);
       S.voiceBuf = ctx.createBuffer(1, samples.length, SR); S.voiceBuf.getChannelData(0).set(samples);
       $('empty').style.display = 'none';
-      $('playBtn').disabled = false; $('exportBtn').disabled = false; $('shareBtn').disabled = false;
+      $('playBtn').disabled = false; $('exportBtn').disabled = false; $('shareBtn').disabled = false; $('wavBtn').disabled = false;
       const d = S.q.drums.filter(x => x.cls !== 'off').length, b = S.q.bass.length;
       $('status').textContent = `${d} hits · ${b} bass notes`;
       $('roll').scrollLeft = 0;
@@ -743,6 +753,19 @@
     requant(); restart();
   }
   $('follow').onchange = e => { S.follow = e.target.checked; if (S.groove) { buildMap(S.bpm, null); requant(); restart(); } };
+  const KN = ['C', 'C#', 'D', 'Eb', 'E', 'F', 'F#', 'G', 'Ab', 'A', 'Bb', 'B'];
+  (() => {
+    const sel = $('keySel');
+    const add = (v, t) => { const o = document.createElement('option'); o.value = v; o.textContent = t; sel.appendChild(o); };
+    add('auto', 'Auto detect'); add('off', 'Off (raw pitch)');
+    for (let k = 0; k < 12; k++) add(k + 'm', KN[k] + ' minor');
+    for (let k = 0; k < 12; k++) add(k + 'M', KN[k] + ' major');
+    sel.value = 'auto';
+    sel.onchange = e => { const v = e.target.value; S.key = v === 'auto' || v === 'off' ? v : { tonic: parseInt(v), minor: v.endsWith('m') }; if (S.A) { regroove(true); restart(); } };
+  })();
+  $('mergeSlides').onchange = e => { S.mergeSlides = e.target.checked; if (S.A) { regroove(true); restart(); } };
+  $('onePerStep').onchange = e => { S.onePerStep = e.target.checked; requant(); restart(); };
+  $('stack').onchange = e => { S.stack = e.target.checked; if (S.A) { regroove(true); restart(); } };
   $('dbPrev').onclick = () => shiftDownbeat(-1);
   $('dbNext').onclick = () => shiftDownbeat(1);
   $('program').onchange = e => { S.program = +e.target.value; $('soundSum').textContent = PATCH[S.program]; if (ctx) loadSounds(); restart(); };
@@ -759,6 +782,7 @@
     $('strVal').textContent = Math.round(S.strength * 100) + '%';
     $('swingVal').textContent = Math.round(S.swing * 100) + '%';
     $('octVal').textContent = (S.octave > 0 ? '+' : '') + S.octave;
+    $('keyVal').textContent = S.key === 'off' ? 'off' : S.keyFound ? KN[S.keyFound.tonic] + (S.keyFound.minor ? ' minor' : ' major') : '–';
     const gl = { 8: '1/8', 16: '1/16', 24: '1/16T', 32: '1/32' }[S.grid];
     $('feelSum').textContent = `${S.follow ? '~' : ''}${S.bpm} BPM · ${gl} · ${Math.round(S.strength * 100)}%`;
     if (S.q) $('status').textContent = `${S.q.drums.filter(d => d.cls !== 'off').length} hits · ${S.q.bass.filter(b => !b.off).length} bass notes`;
@@ -769,7 +793,7 @@
   (async () => {
     try { if (window.claude && window.claude.use) downloads = await window.claude.use('downloads'); } catch (e) {}
     if (downloads) $('exportNote').textContent = 'Saves a .zip with three MIDI files: the full groove, bass only and drums only. Unzip it in Files, then drag into your DAW.';
-    else if (navigator.canShare) $('shareBtn').style.display = '';
+    else { if (navigator.canShare) $('shareBtn').style.display = ''; $('wavBtn').style.display = ''; }
   })();
   function exportData() {
     const g = { drums: S.q.drums.filter(d => d.cls !== 'off'), bass: S.q.bass.filter(b => !b.off) };
@@ -796,6 +820,23 @@
     const f = ex.files[0];
     const url = URL.createObjectURL(new Blob([f.data], { type: 'audio/midi' }));
     const a = document.createElement('a'); a.href = url; a.download = f.name; document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 4000);
+  };
+  function wavBytes(samples, sr) {
+    const n = samples.length, buf = new ArrayBuffer(44 + n * 2), v = new DataView(buf);
+    const w = (o, str) => { for (let i = 0; i < str.length; i++) v.setUint8(o + i, str.charCodeAt(i)); };
+    w(0, 'RIFF'); v.setUint32(4, 36 + n * 2, true); w(8, 'WAVE'); w(12, 'fmt '); v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+    v.setUint32(24, sr, true); v.setUint32(28, sr * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true); w(36, 'data'); v.setUint32(40, n * 2, true);
+    for (let i = 0; i < n; i++) v.setInt16(44 + i * 2, Math.max(-1, Math.min(1, samples[i])) * 32767, true);
+    return new Uint8Array(buf);
+  }
+  $('wavBtn').onclick = async () => {
+    if (!S.take) return;
+    const name = (S.take.name || 'take') + ` ${S.bpm}bpm.wav`;
+    const data = wavBytes(S.take.samples, SR);
+    const file = new File([data], name, { type: 'audio/wav' });
+    if (navigator.canShare && navigator.canShare({ files: [file] })) { try { await navigator.share({ files: [file], title: name }); return; } catch (e) { if (e.name === 'AbortError') return; } }
+    const url = URL.createObjectURL(file); const a = document.createElement('a'); a.href = url; a.download = name; document.body.appendChild(a); a.click(); a.remove();
     setTimeout(() => URL.revokeObjectURL(url), 4000);
   };
   $('shareBtn').onclick = async () => {

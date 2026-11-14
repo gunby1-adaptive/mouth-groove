@@ -176,6 +176,10 @@
         <div class="field"><span>Bass octave <b id="octVal">0</b></span>
           <div class="row"><button class="b sm" id="octDown">Octave down</button><button class="b sm" id="octUp">Octave up</button></div>
         </div>
+        <div class="field"><span>Snap bass to key <b id="keyVal">auto</b></span>
+          <select id="keySel"></select>
+        </div>
+        <label class="toggle"><input type="checkbox" id="mergeSlides" checked> Merge slides into one note</label>
         <div class="note">Drums play on the General MIDI kit: kick 36, snare 38, closed hat 42, channel 10.</div>
       </div>
     </details>
@@ -184,6 +188,8 @@
       <div class="pane">
         <div class="field"><span>Drum sensitivity <b id="dsVal">50</b></span><input type="range" id="drumSens" min="0" max="1" step="0.05" value="0.5"></div>
         <div class="field"><span>Bass sensitivity <b id="bsVal">50</b></span><input type="range" id="bassSens" min="0" max="1" step="0.05" value="0.5"></div>
+        <label class="toggle"><input type="checkbox" id="onePerStep" checked> One drum per grid step (keeps the loudest)</label>
+        <label class="toggle"><input type="checkbox" id="stack"> Allow stacked hits (bass note plus hat or snare at once)</label>
         <div class="field"><span>Merge double clicks within <b id="mgVal">65 ms</b></span><input type="range" id="merge" min="0" max="120" step="5" value="65"></div>
         <div class="note">More drum sensitivity catches ghost notes but can add false hits. More bass sensitivity catches quieter notes.</div>
       </div>
@@ -204,6 +210,7 @@
         <div class="row">
           <button class="b primary" id="exportBtn" disabled>Export MIDI</button>
           <button class="b" id="shareBtn" disabled style="display:none">Share…</button>
+          <button class="b" id="wavBtn" disabled style="display:none">Save recording (.wav)</button>
         </div>
       </div>
     </details>
@@ -684,9 +691,9 @@
     const ref = c => median(raw.filter(o => o.cls === c).map(o => o.ft.upper.level));
     const hsRef = Math.min(ref('hat') || Infinity, ref('snare') || Infinity);
     const kickRef = ref('kick');
-    const thr = Math.max(0.45 * (hsRef || 0), 2.2 * (kickRef || 0)) * (1.3 - 0.6 * (opts.drumSensitivity ?? 0.5));
+    const thr = Math.max(0.6 * (hsRef || 0), 3 * (kickRef || 0)) * (1.3 - 0.6 * (opts.drumSensitivity ?? 0.5));
     const extra = [];
-    if (hsRef > 0 && hsRef < Infinity) for (const o of raw) {
+    if (opts.stack !== false && hsRef > 0 && hsRef < Infinity) for (const o of raw) {
       if ((o.cls === 'bass' || o.cls === 'kick') && o.ft.upper.level > thr) {
         extra.push({ t: o.t, sample: o.sample, strength: o.strength, ft: o.ft, cls: upperClass(o.ft.upper, model), layered: true });
       }
@@ -712,6 +719,63 @@
     for (const c of ['kick', 'snare', 'hat']) lv[c] = percentile(drums.filter(d => d.cls === c).map(lev), 0.9) || 1;
     for (const d of drums) d.vel = Math.max(35, Math.min(127, Math.round(105 + 45 * Math.log10(lev(d) / lv[d.cls]))));
     return { drums: drums.map(d => ({ t: d.t, cls: d.cls, vel: d.vel, ft: d.ft, layered: !!d.layered })), bass, onsets: raw };
+  }
+
+  // ---------- bass cleanup: merge slides, snap to a key ----------
+  const MAJ = [6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88];
+  const MIN = [6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17];
+  function detectKey(bass) {
+    const h = new Array(12).fill(0);
+    for (const b of bass) h[((b.note % 12) + 12) % 12] += Math.min(0.6, b.dur) * (b.vel || 100);
+    const corr = (prof, k) => { let mx = 0, my = 0; for (let i = 0; i < 12; i++) { mx += h[i] / 12; my += prof[i] / 12; }
+      let sxy = 0, sxx = 0, syy = 0; for (let i = 0; i < 12; i++) { const x = h[(i + k) % 12] - mx, y = prof[i] - my; sxy += x * y; sxx += x * x; syy += y * y; } return sxy / Math.sqrt(sxx * syy + 1e-12); };
+    let best = { tonic: 0, minor: true, r: -2 };
+    for (let k = 0; k < 12; k++) for (const minor of [false, true]) { const r = corr(minor ? MIN : MAJ, k); if (r > best.r) best = { tonic: k, minor, r }; }
+    return best;
+  }
+  function scaleOf(key) {
+    const steps = key.minor ? [0, 2, 3, 5, 7, 8, 10] : [0, 2, 4, 5, 7, 9, 11];
+    return steps.map(x => (x + key.tonic) % 12);
+  }
+  function cleanBass(bass, opts) {
+    let out = bass.map(b => Object.assign({}, b, { raw: b.note + (b.cents || 0) / 100 }));
+    out.sort((a, b) => a.t - b.t);
+    // merge slides: a note that runs straight into a neighbour within a semitone is one note
+    if (opts.merge !== false) {
+      const m = [];
+      for (const b of out) {
+        const p = m[m.length - 1];
+        if (p && b.t - (p.t + p.dur) < 0.04 && Math.abs(b.raw - p.raw) <= 1.3) {
+          const end = Math.max(p.t + p.dur, b.t + b.dur);
+          if (b.dur > p.dur * 1.5) { p.note = b.note; p.raw = b.raw; }
+          p.dur = end - p.t; p.vel = Math.max(p.vel, b.vel); p.level = Math.max(p.level, b.level);
+          continue;
+        }
+        m.push(b);
+      }
+      out = m;
+    }
+    let key = null;
+    if (opts.key && opts.key !== 'off' && out.length) {
+      key = opts.key === 'auto' ? detectKey(out) : opts.key;
+      const sc = scaleOf(key);
+      for (const b of out) {
+        const pc = ((b.note % 12) + 12) % 12;
+        if (sc.includes(pc)) continue;
+        // out of key: move to the in-key neighbour nearest the sung pitch
+        const up = b.note + 1, dn = b.note - 1;
+        const upOk = sc.includes(((up % 12) + 12) % 12), dnOk = sc.includes(((dn % 12) + 12) % 12);
+        if (upOk && dnOk) b.note = (b.raw >= b.note) ? up : dn;
+        else b.note = upOk ? up : dn;
+      }
+      // after snapping, neighbours may now be the same note: merge again
+      if (opts.merge !== false) {
+        const m = [];
+        for (const b of out) { const p = m[m.length - 1]; if (p && p.note === b.note && b.t - (p.t + p.dur) < 0.04) { p.dur = b.t + b.dur - p.t; continue; } m.push(b); }
+        out = m;
+      }
+    }
+    return { bass: out, key };
   }
 
   // ---------- calibration: isolated hits of one class ----------
@@ -925,7 +989,7 @@
   }
   function shiftMap(map, sixteenths) { return Object.assign({}, map, { k0: map.k0 - sixteenths }); }
 
-  function quantizeGroove(groove, map, gridDiv, strength, swing) {
+  function quantizeGroove(groove, map, gridDiv, strength, swing, opts) {
     const step = 16 / gridDiv; // in 16ths
     const qu = u => {
       const k = Math.round(u / step);
@@ -933,7 +997,13 @@
       if (swing && (gridDiv === 16 || gridDiv === 8) && (k % 2 !== 0)) target += step * swing * 0.5;
       return u + strength * (target - u);
     };
-    const drums = groove.drums.map(d => { const u = uOf(map, d.t), q = qu(u); return Object.assign({}, d, { u, qu: q, qt: tOf(map, q) }); });
+    let drums = groove.drums.map(d => { const u = uOf(map, d.t), q = qu(u); return Object.assign({}, d, { u, qu: q, qt: tOf(map, q) }); });
+    if (opts && opts.onePerStep && strength > 0.5) {
+      // keep the loudest hit in each grid step; the others become 'off' so they can be restored by tapping
+      const best = new Map();
+      for (const d of drums) { if (d.cls === 'off') continue; const k = Math.round(d.u / step); const b = best.get(k); if (!b || (d.edited && !b.edited) || (d.edited === b.edited && d.vel > b.vel)) best.set(k, d); }
+      drums = drums.map(d => d.cls === 'off' || d.edited || best.get(Math.round(d.u / step)) === d ? d : Object.assign({}, d, { cls: 'off', dup: true }));
+    }
     const bass = groove.bass.map(b => {
       const u = uOf(map, b.t), ue = uOf(map, b.t + b.dur);
       const s = qu(u); let e = qu(ue);
@@ -1021,7 +1091,7 @@
     return out;
   }
 
-  root.MG = { fixedMap, trackGrid, shiftMap, uOf, tOf, biquadLP, calibFromClip, analyze, pickOnsets, features, classify, trainModel, buildGroove, estimateTempo, alignGrid, quantizeGroove, writeMidi, zip, DRUM_NOTES, CLASSES };
+  root.MG = { cleanBass, detectKey, fixedMap, trackGrid, shiftMap, uOf, tOf, biquadLP, calibFromClip, analyze, pickOnsets, features, classify, trainModel, buildGroove, estimateTempo, alignGrid, quantizeGroove, writeMidi, zip, DRUM_NOTES, CLASSES };
 })(typeof window !== 'undefined' ? window : globalThis);
 
 </script>
@@ -1669,6 +1739,7 @@ GM_SOUNDS.drums[42]={
     take: null, A: null, groove: null, q: null, model: null,
     bpm: 100, offset: 0, grid: 16, strength: 1, swing: 0, octave: 0, program: 33,
     drumSens: 0.5, bassSens: 0.5, offsetHint: null, follow: true, mergeMs: 65, map: null,
+    key: 'auto', mergeSlides: true, stack: false, onePerStep: true, keyFound: null,
     edits: {}, bassOff: {}, zoom: 1, playing: false, loop: true, click: false,
   };
 
@@ -1764,7 +1835,9 @@ GM_SOUNDS.drums[42]={
   }
   function regroove(keepTempo) {
     if (!S.A) return;
-    S.groove = MG.buildGroove(S.A, S.model, { drumSensitivity: S.drumSens, bassSensitivity: S.bassSens, bassOctave: 0, mergeMs: S.mergeMs });
+    S.groove = MG.buildGroove(S.A, S.model, { drumSensitivity: S.drumSens, bassSensitivity: S.bassSens, bassOctave: 0, mergeMs: S.mergeMs, stack: S.stack });
+    const cb = MG.cleanBass(S.groove.bass, { merge: S.mergeSlides, key: S.key });
+    S.groove.bass = cb.bass; S.keyFound = cb.key;
     S.edits = {}; S.bassOff = {};
     if (!keepTempo) {
       if (!S.bpmFixed) S.bpm = Math.round(MG.estimateTempo(S.A, S.groove) * 2) / 2;
@@ -1785,14 +1858,14 @@ GM_SOUNDS.drums[42]={
   function currentGroove() {
     const g = S.groove;
     const drums = [];
-    g.drums.forEach((d, i) => { const c = S.edits[i] || d.cls; drums.push(Object.assign({}, d, { cls: c, i })); });
+    g.drums.forEach((d, i) => { const c = S.edits[i] || d.cls; drums.push(Object.assign({}, d, { cls: c, i, edited: !!S.edits[i] || !!d.added })); });
     const bass = g.bass.map((b, i) => Object.assign({}, b, { note: b.note + 12 * S.octave, i, off: !!S.bassOff[i] }));
     return { drums, bass };
   }
   function requant() {
     if (!S.groove) return;
     const g = currentGroove();
-    S.q = MG.quantizeGroove(g, S.map, S.grid, S.strength, S.swing);
+    S.q = MG.quantizeGroove(g, S.map, S.grid, S.strength, S.swing, { onePerStep: S.onePerStep });
     syncUI(); draw();
   }
 
@@ -1809,7 +1882,7 @@ GM_SOUNDS.drums[42]={
       regroove(false);
       S.voiceBuf = ctx.createBuffer(1, samples.length, SR); S.voiceBuf.getChannelData(0).set(samples);
       $('empty').style.display = 'none';
-      $('playBtn').disabled = false; $('exportBtn').disabled = false; $('shareBtn').disabled = false;
+      $('playBtn').disabled = false; $('exportBtn').disabled = false; $('shareBtn').disabled = false; $('wavBtn').disabled = false;
       const d = S.q.drums.filter(x => x.cls !== 'off').length, b = S.q.bass.length;
       $('status').textContent = `${d} hits · ${b} bass notes`;
       $('roll').scrollLeft = 0;
@@ -2176,6 +2249,19 @@ GM_SOUNDS.drums[42]={
     requant(); restart();
   }
   $('follow').onchange = e => { S.follow = e.target.checked; if (S.groove) { buildMap(S.bpm, null); requant(); restart(); } };
+  const KN = ['C', 'C#', 'D', 'Eb', 'E', 'F', 'F#', 'G', 'Ab', 'A', 'Bb', 'B'];
+  (() => {
+    const sel = $('keySel');
+    const add = (v, t) => { const o = document.createElement('option'); o.value = v; o.textContent = t; sel.appendChild(o); };
+    add('auto', 'Auto detect'); add('off', 'Off (raw pitch)');
+    for (let k = 0; k < 12; k++) add(k + 'm', KN[k] + ' minor');
+    for (let k = 0; k < 12; k++) add(k + 'M', KN[k] + ' major');
+    sel.value = 'auto';
+    sel.onchange = e => { const v = e.target.value; S.key = v === 'auto' || v === 'off' ? v : { tonic: parseInt(v), minor: v.endsWith('m') }; if (S.A) { regroove(true); restart(); } };
+  })();
+  $('mergeSlides').onchange = e => { S.mergeSlides = e.target.checked; if (S.A) { regroove(true); restart(); } };
+  $('onePerStep').onchange = e => { S.onePerStep = e.target.checked; requant(); restart(); };
+  $('stack').onchange = e => { S.stack = e.target.checked; if (S.A) { regroove(true); restart(); } };
   $('dbPrev').onclick = () => shiftDownbeat(-1);
   $('dbNext').onclick = () => shiftDownbeat(1);
   $('program').onchange = e => { S.program = +e.target.value; $('soundSum').textContent = PATCH[S.program]; if (ctx) loadSounds(); restart(); };
@@ -2192,6 +2278,7 @@ GM_SOUNDS.drums[42]={
     $('strVal').textContent = Math.round(S.strength * 100) + '%';
     $('swingVal').textContent = Math.round(S.swing * 100) + '%';
     $('octVal').textContent = (S.octave > 0 ? '+' : '') + S.octave;
+    $('keyVal').textContent = S.key === 'off' ? 'off' : S.keyFound ? KN[S.keyFound.tonic] + (S.keyFound.minor ? ' minor' : ' major') : '–';
     const gl = { 8: '1/8', 16: '1/16', 24: '1/16T', 32: '1/32' }[S.grid];
     $('feelSum').textContent = `${S.follow ? '~' : ''}${S.bpm} BPM · ${gl} · ${Math.round(S.strength * 100)}%`;
     if (S.q) $('status').textContent = `${S.q.drums.filter(d => d.cls !== 'off').length} hits · ${S.q.bass.filter(b => !b.off).length} bass notes`;
@@ -2202,7 +2289,7 @@ GM_SOUNDS.drums[42]={
   (async () => {
     try { if (window.claude && window.claude.use) downloads = await window.claude.use('downloads'); } catch (e) {}
     if (downloads) $('exportNote').textContent = 'Saves a .zip with three MIDI files: the full groove, bass only and drums only. Unzip it in Files, then drag into your DAW.';
-    else if (navigator.canShare) $('shareBtn').style.display = '';
+    else { if (navigator.canShare) $('shareBtn').style.display = ''; $('wavBtn').style.display = ''; }
   })();
   function exportData() {
     const g = { drums: S.q.drums.filter(d => d.cls !== 'off'), bass: S.q.bass.filter(b => !b.off) };
@@ -2229,6 +2316,23 @@ GM_SOUNDS.drums[42]={
     const f = ex.files[0];
     const url = URL.createObjectURL(new Blob([f.data], { type: 'audio/midi' }));
     const a = document.createElement('a'); a.href = url; a.download = f.name; document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 4000);
+  };
+  function wavBytes(samples, sr) {
+    const n = samples.length, buf = new ArrayBuffer(44 + n * 2), v = new DataView(buf);
+    const w = (o, str) => { for (let i = 0; i < str.length; i++) v.setUint8(o + i, str.charCodeAt(i)); };
+    w(0, 'RIFF'); v.setUint32(4, 36 + n * 2, true); w(8, 'WAVE'); w(12, 'fmt '); v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+    v.setUint32(24, sr, true); v.setUint32(28, sr * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true); w(36, 'data'); v.setUint32(40, n * 2, true);
+    for (let i = 0; i < n; i++) v.setInt16(44 + i * 2, Math.max(-1, Math.min(1, samples[i])) * 32767, true);
+    return new Uint8Array(buf);
+  }
+  $('wavBtn').onclick = async () => {
+    if (!S.take) return;
+    const name = (S.take.name || 'take') + ` ${S.bpm}bpm.wav`;
+    const data = wavBytes(S.take.samples, SR);
+    const file = new File([data], name, { type: 'audio/wav' });
+    if (navigator.canShare && navigator.canShare({ files: [file] })) { try { await navigator.share({ files: [file], title: name }); return; } catch (e) { if (e.name === 'AbortError') return; } }
+    const url = URL.createObjectURL(file); const a = document.createElement('a'); a.href = url; a.download = name; document.body.appendChild(a); a.click(); a.remove();
     setTimeout(() => URL.revokeObjectURL(url), 4000);
   };
   $('shareBtn').onclick = async () => {

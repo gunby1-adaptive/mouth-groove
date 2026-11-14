@@ -462,9 +462,9 @@
     const ref = c => median(raw.filter(o => o.cls === c).map(o => o.ft.upper.level));
     const hsRef = Math.min(ref('hat') || Infinity, ref('snare') || Infinity);
     const kickRef = ref('kick');
-    const thr = Math.max(0.45 * (hsRef || 0), 2.2 * (kickRef || 0)) * (1.3 - 0.6 * (opts.drumSensitivity ?? 0.5));
+    const thr = Math.max(0.6 * (hsRef || 0), 3 * (kickRef || 0)) * (1.3 - 0.6 * (opts.drumSensitivity ?? 0.5));
     const extra = [];
-    if (hsRef > 0 && hsRef < Infinity) for (const o of raw) {
+    if (opts.stack !== false && hsRef > 0 && hsRef < Infinity) for (const o of raw) {
       if ((o.cls === 'bass' || o.cls === 'kick') && o.ft.upper.level > thr) {
         extra.push({ t: o.t, sample: o.sample, strength: o.strength, ft: o.ft, cls: upperClass(o.ft.upper, model), layered: true });
       }
@@ -490,6 +490,63 @@
     for (const c of ['kick', 'snare', 'hat']) lv[c] = percentile(drums.filter(d => d.cls === c).map(lev), 0.9) || 1;
     for (const d of drums) d.vel = Math.max(35, Math.min(127, Math.round(105 + 45 * Math.log10(lev(d) / lv[d.cls]))));
     return { drums: drums.map(d => ({ t: d.t, cls: d.cls, vel: d.vel, ft: d.ft, layered: !!d.layered })), bass, onsets: raw };
+  }
+
+  // ---------- bass cleanup: merge slides, snap to a key ----------
+  const MAJ = [6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88];
+  const MIN = [6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17];
+  function detectKey(bass) {
+    const h = new Array(12).fill(0);
+    for (const b of bass) h[((b.note % 12) + 12) % 12] += Math.min(0.6, b.dur) * (b.vel || 100);
+    const corr = (prof, k) => { let mx = 0, my = 0; for (let i = 0; i < 12; i++) { mx += h[i] / 12; my += prof[i] / 12; }
+      let sxy = 0, sxx = 0, syy = 0; for (let i = 0; i < 12; i++) { const x = h[(i + k) % 12] - mx, y = prof[i] - my; sxy += x * y; sxx += x * x; syy += y * y; } return sxy / Math.sqrt(sxx * syy + 1e-12); };
+    let best = { tonic: 0, minor: true, r: -2 };
+    for (let k = 0; k < 12; k++) for (const minor of [false, true]) { const r = corr(minor ? MIN : MAJ, k); if (r > best.r) best = { tonic: k, minor, r }; }
+    return best;
+  }
+  function scaleOf(key) {
+    const steps = key.minor ? [0, 2, 3, 5, 7, 8, 10] : [0, 2, 4, 5, 7, 9, 11];
+    return steps.map(x => (x + key.tonic) % 12);
+  }
+  function cleanBass(bass, opts) {
+    let out = bass.map(b => Object.assign({}, b, { raw: b.note + (b.cents || 0) / 100 }));
+    out.sort((a, b) => a.t - b.t);
+    // merge slides: a note that runs straight into a neighbour within a semitone is one note
+    if (opts.merge !== false) {
+      const m = [];
+      for (const b of out) {
+        const p = m[m.length - 1];
+        if (p && b.t - (p.t + p.dur) < 0.04 && Math.abs(b.raw - p.raw) <= 1.3) {
+          const end = Math.max(p.t + p.dur, b.t + b.dur);
+          if (b.dur > p.dur * 1.5) { p.note = b.note; p.raw = b.raw; }
+          p.dur = end - p.t; p.vel = Math.max(p.vel, b.vel); p.level = Math.max(p.level, b.level);
+          continue;
+        }
+        m.push(b);
+      }
+      out = m;
+    }
+    let key = null;
+    if (opts.key && opts.key !== 'off' && out.length) {
+      key = opts.key === 'auto' ? detectKey(out) : opts.key;
+      const sc = scaleOf(key);
+      for (const b of out) {
+        const pc = ((b.note % 12) + 12) % 12;
+        if (sc.includes(pc)) continue;
+        // out of key: move to the in-key neighbour nearest the sung pitch
+        const up = b.note + 1, dn = b.note - 1;
+        const upOk = sc.includes(((up % 12) + 12) % 12), dnOk = sc.includes(((dn % 12) + 12) % 12);
+        if (upOk && dnOk) b.note = (b.raw >= b.note) ? up : dn;
+        else b.note = upOk ? up : dn;
+      }
+      // after snapping, neighbours may now be the same note: merge again
+      if (opts.merge !== false) {
+        const m = [];
+        for (const b of out) { const p = m[m.length - 1]; if (p && p.note === b.note && b.t - (p.t + p.dur) < 0.04) { p.dur = b.t + b.dur - p.t; continue; } m.push(b); }
+        out = m;
+      }
+    }
+    return { bass: out, key };
   }
 
   // ---------- calibration: isolated hits of one class ----------
@@ -703,7 +760,7 @@
   }
   function shiftMap(map, sixteenths) { return Object.assign({}, map, { k0: map.k0 - sixteenths }); }
 
-  function quantizeGroove(groove, map, gridDiv, strength, swing) {
+  function quantizeGroove(groove, map, gridDiv, strength, swing, opts) {
     const step = 16 / gridDiv; // in 16ths
     const qu = u => {
       const k = Math.round(u / step);
@@ -711,7 +768,13 @@
       if (swing && (gridDiv === 16 || gridDiv === 8) && (k % 2 !== 0)) target += step * swing * 0.5;
       return u + strength * (target - u);
     };
-    const drums = groove.drums.map(d => { const u = uOf(map, d.t), q = qu(u); return Object.assign({}, d, { u, qu: q, qt: tOf(map, q) }); });
+    let drums = groove.drums.map(d => { const u = uOf(map, d.t), q = qu(u); return Object.assign({}, d, { u, qu: q, qt: tOf(map, q) }); });
+    if (opts && opts.onePerStep && strength > 0.5) {
+      // keep the loudest hit in each grid step; the others become 'off' so they can be restored by tapping
+      const best = new Map();
+      for (const d of drums) { if (d.cls === 'off') continue; const k = Math.round(d.u / step); const b = best.get(k); if (!b || (d.edited && !b.edited) || (d.edited === b.edited && d.vel > b.vel)) best.set(k, d); }
+      drums = drums.map(d => d.cls === 'off' || d.edited || best.get(Math.round(d.u / step)) === d ? d : Object.assign({}, d, { cls: 'off', dup: true }));
+    }
     const bass = groove.bass.map(b => {
       const u = uOf(map, b.t), ue = uOf(map, b.t + b.dur);
       const s = qu(u); let e = qu(ue);
@@ -799,5 +862,5 @@
     return out;
   }
 
-  root.MG = { fixedMap, trackGrid, shiftMap, uOf, tOf, biquadLP, calibFromClip, analyze, pickOnsets, features, classify, trainModel, buildGroove, estimateTempo, alignGrid, quantizeGroove, writeMidi, zip, DRUM_NOTES, CLASSES };
+  root.MG = { cleanBass, detectKey, fixedMap, trackGrid, shiftMap, uOf, tOf, biquadLP, calibFromClip, analyze, pickOnsets, features, classify, trainModel, buildGroove, estimateTempo, alignGrid, quantizeGroove, writeMidi, zip, DRUM_NOTES, CLASSES };
 })(typeof window !== 'undefined' ? window : globalThis);
